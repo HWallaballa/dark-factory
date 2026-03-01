@@ -6,17 +6,17 @@ Wants=ollama.service
 [Service]
 Type=simple
 User=gilberto
-WorkingDirectory=/home/gilberto/Desktop/Pinehaven Ventures/dark-factory
-ExecStart=/home/gilberto/Desktop/Pinehaven Ventures/dark-factory/scripts/orchestrator.sh
+WorkingDirectory=/home/gilberto
+ExecStart=/home/gilberto/.local/bin/dark-factory-orchestrator
 Restart=on-failure
 RestartSec=10
 
-# Inject secrets from environment file (never commit this file)
+# Secrets (API keys) — never in git
 EnvironmentFile=/home/gilberto/.config/dark-factory/secrets.env
 
-# Logging
-StandardOutput=append:/home/gilberto/Desktop/Pinehaven Ventures/dark-factory/logs/service.log
-StandardError=append:/home/gilberto/Desktop/Pinehaven Ventures/dark-factory/logs/service-error.log
+# Logs go to a path without spaces
+StandardOutput=append:/home/gilberto/.local/share/dark-factory/service.log
+StandardError=append:/home/gilberto/.local/share/dark-factory/service-error.log
 
 [Install]
 WantedBy=multi-user.target

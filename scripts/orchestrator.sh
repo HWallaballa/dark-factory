@@ -13,7 +13,7 @@
 set -euo pipefail
 
 # --- Config ------------------------------------------------------------------
-DARK_FACTORY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DARK_FACTORY_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 SPECS_DIR="$DARK_FACTORY_DIR/specs"
 IN_PROGRESS_DIR="$SPECS_DIR/in-progress"
 COMPLETED_DIR="$SPECS_DIR/completed"
@@ -74,18 +74,17 @@ notify() {
 }
 
 # --- Route spec to the right engine ------------------------------------------
-# Returns: "local" | "haiku" | "sonnet"
-# Based on estimated_complexity field in spec frontmatter
+# Code implementation always uses Claude Code CLI (only thing that writes files).
+# Local Ollama is reserved for meta-tasks (commit messages, summaries) — future use.
+# Returns: "sonnet" for all code specs
 route_spec() {
   local spec_file="$1"
-  local complexity
-  complexity=$(grep -m1 '^- \*\*estimated_complexity:\*\*' "$spec_file" 2>/dev/null | grep -oP '(small|medium|large)' || echo "medium")
+  local task_type
+  task_type=$(grep -m1 '^- \*\*task_type:\*\*' "$spec_file" 2>/dev/null | grep -oP '(meta|code)' || echo "code")
 
-  case "$complexity" in
-    small)  echo "local" ;;
-    medium) echo "sonnet" ;;
-    large)  echo "sonnet" ;;
-    *)      echo "sonnet" ;;
+  case "$task_type" in
+    meta)  echo "local" ;;   # commit messages, summaries, non-file tasks
+    *)     echo "sonnet" ;;  # all code implementation → Claude Code CLI
   esac
 }
 
@@ -107,7 +106,7 @@ run_local() {
 
 # --- Run with Claude Code CLI ------------------------------------------------
 run_claude() {
-  local spec_name="$1" prompt="$2" run_log="$3"
+  local spec_name="$1" prompt="$2" run_log="$3" target_repo="$4"
 
   log "  Engine: Claude Sonnet (API)"
 
@@ -115,32 +114,51 @@ run_claude() {
   local todays_spend
   todays_spend=$(get_todays_spend)
   if python3 -c "exit(0 if float('$todays_spend') < $DAILY_BUDGET_USD else 1)" 2>/dev/null; then
-    log "  Today's spend so far: \$${todays_spend} / \$${DAILY_BUDGET_USD} budget"
+    log "  Today's spend: \$${todays_spend} / \$${DAILY_BUDGET_USD} budget"
   else
-    log "⚠️  DAILY BUDGET REACHED (\$${todays_spend} >= \$${DAILY_BUDGET_USD}). Skipping Claude API call."
-    log "   Spec '$spec_name' requeued for tomorrow or increase DAILY_BUDGET_USD."
-    notify "⚠️ Budget Paused" "Daily budget of \$$DAILY_BUDGET_USD reached. Factory paused until midnight."
+    log "⚠️  DAILY BUDGET REACHED (\$${todays_spend} >= \$${DAILY_BUDGET_USD}). Requeuing."
+    notify "⚠️ Budget Paused" "Daily budget of \$$DAILY_BUDGET_USD reached. Restarting at midnight."
     return 1
   fi
 
-  # Write prompt to a temp file so Claude Code can use --print mode
-  local tmp_prompt
-  tmp_prompt=$(mktemp /tmp/dark-factory-spec-XXXXXX.md)
-  echo "$prompt" > "$tmp_prompt"
+  # Validate target repo exists
+  if [[ ! -d "$target_repo" ]]; then
+    log "❌ Target repo not found: $target_repo"
+    return 1
+  fi
+
+  log "  Target repo: $target_repo"
+
+  # Build a full implementation prompt for Claude Code
+  local full_prompt
+  full_prompt="You are an autonomous software engineer. Implement the following spec completely.
+
+IMPORTANT RULES:
+- Create a git branch named: spec/${spec_name}-$(date +%Y%m%d)
+- Write all code changes to the files specified in the spec
+- Run any available tests (npm test, etc.) and fix failures
+- Open a GitHub PR with: title = 'feat: ${spec_name}', body = summary of what was built
+- Do NOT ask for clarification — make reasonable decisions and document them in the PR
+
+SPEC:
+${prompt}"
 
   local exit_code=0
-  ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}" claude \
-    --print \
-    --no-color \
-    --dangerously-skip-permissions \
-    -p "$(cat "$tmp_prompt")" \
-    >> "$run_log" 2>&1 || exit_code=$?
 
-  rm -f "$tmp_prompt"
+  # Run Claude Code in the target repo directory
+  (
+    cd "$target_repo"
+    ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}" claude \
+      --print \
+      --no-color \
+      --dangerously-skip-permissions \
+      -p "$full_prompt" \
+      >> "$run_log" 2>&1
+  ) || exit_code=$?
 
-  # Estimate cost from log output (rough: count words as proxy for tokens)
+  # Estimate cost (word count proxy)
   local words_in words_out est_cost
-  words_in=$(wc -w < "$tmp_prompt" 2>/dev/null || echo 500)
+  words_in=$(echo "$full_prompt" | wc -w)
   words_out=$(wc -w < "$run_log" 2>/dev/null || echo 1000)
   est_cost=$(python3 -c "print(round(($words_in/750)*$COST_PER_1K_INPUT + ($words_out/750)*$COST_PER_1K_OUTPUT, 4))")
   log_cost "$spec_name" "claude-sonnet" "$est_cost" "$words_in" "$words_out"
@@ -163,14 +181,19 @@ dispatch_spec() {
   mv "$spec_file" "$IN_PROGRESS_DIR/"
   local working_spec="$IN_PROGRESS_DIR/$spec_name.md"
 
+  # Extract target repo from spec (fallback to website repo)
+  local target_repo
+  target_repo=$(grep -m1 '^\- \*\*repo:\*\*' "$working_spec" 2>/dev/null | sed 's/.*\*\*repo:\*\* *//' | xargs || true)
+  target_repo="${target_repo:-/home/gilberto/Desktop/Pinehaven Ventures/pinehaven-ventures-website}"
+
   local engine
   engine=$(route_spec "$working_spec")
-  log "  Route: $engine"
+  log "  Route: $engine | Repo: $(basename "$target_repo")"
 
   local prompt
   prompt="$(cat "$working_spec")"
 
-  notify "🏭 Dark Factory" "Starting: $spec_name (engine: $engine)"
+  notify "🏭 Dark Factory" "Starting: $spec_name → $(basename "$target_repo")"
 
   local exit_code=0
 
@@ -178,17 +201,16 @@ dispatch_spec() {
     local)
       run_local "$spec_name" "$prompt" "$run_log" || exit_code=$?
       ;;
-    haiku|sonnet)
-      run_claude "$spec_name" "$prompt" "$run_log" || exit_code=$?
+    *)
+      run_claude "$spec_name" "$prompt" "$run_log" "$target_repo" || exit_code=$?
       ;;
   esac
 
   if [[ $exit_code -eq 0 ]]; then
     mv "$working_spec" "$COMPLETED_DIR/"
     log "✅ Complete: $spec_name"
-    notify "✅ Done" "$spec_name complete. Review the PR."
+    notify "✅ Done" "$spec_name complete. Review the PR on GitHub."
   else
-    # Requeue: move back to specs/
     mv "$working_spec" "$SPECS_DIR/"
     log "❌ Failed: $spec_name (exit $exit_code). Requeued. See: $run_log"
     notify "❌ Failed" "$spec_name failed. Check $run_log"
