@@ -145,14 +145,11 @@ ${prompt}"
 
   local exit_code=0
 
-  # Run Claude Code in the target repo directory
+  # Claude Code requires a real TTY — use script(1) to provide one
   (
     cd "$target_repo"
-    ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}" claude \
-      --print \
-      --no-color \
-      --dangerously-skip-permissions \
-      -p "$full_prompt" \
+    script -q -e /dev/null -c \
+      "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-} claude --dangerously-skip-permissions -p $(printf '%q' "$full_prompt")" \
       >> "$run_log" 2>&1
   ) || exit_code=$?
 
